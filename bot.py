@@ -14,6 +14,10 @@ VIP_LINK = os.environ.get("VIP_LINK")
 CHANNEL_LINK = os.environ.get("CHANNEL_LINK")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
+# Список администраторов (ADMIN_IDS=id1,id2,id3 или пусто — доступ для всех)
+_raw_admin_ids = os.environ.get("ADMIN_IDS", "")
+ADMIN_IDS = [int(uid.strip()) for uid in _raw_admin_ids.split(",") if uid.strip()] if _raw_admin_ids.strip() else []
+
 # Инициализация БД
 def init_db():
     try:
@@ -104,10 +108,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Только для админа (твой ID)
-    ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-    
-    if update.effective_user.id != ADMIN_ID:
+    # Только для администраторов
+    if ADMIN_IDS and update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ У тебя нет прав на рассылку")
         return
     
@@ -140,9 +142,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-
-    if ADMIN_ID and update.effective_user.id != ADMIN_ID:
+    if ADMIN_IDS and update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ У тебя нет прав для просмотра подписчиков")
         return
 
