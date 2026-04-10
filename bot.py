@@ -14,6 +14,24 @@ VIP_LINK = os.environ.get("VIP_LINK")
 CHANNEL_LINK = os.environ.get("CHANNEL_LINK")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
+def get_admin_ids():
+    """Return a list of admin user IDs parsed from ADMIN_IDS (comma-separated).
+    Falls back to ADMIN_ID (singular) for backward compatibility.
+    Returns an empty list if neither variable is set, which grants access to all users."""
+    raw = os.environ.get("ADMIN_IDS", "").strip()
+    if raw:
+        ids = []
+        for part in raw.split(","):
+            part = part.strip()
+            if part.isdigit():
+                ids.append(int(part))
+        return ids
+    # Backward compatibility: fall back to singular ADMIN_ID
+    singular = os.environ.get("ADMIN_ID", "").strip()
+    if singular.isdigit():
+        return [int(singular)]
+    return []
+
 # Инициализация БД
 def init_db():
     try:
@@ -104,11 +122,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Только для админа (твой ID)
-    _admin_id_raw = os.environ.get("ADMIN_ID")
-    ADMIN_ID = int(_admin_id_raw) if _admin_id_raw else None
-
-    if ADMIN_ID is not None and update.effective_user.id != ADMIN_ID:
+    # Только для админов
+    admin_ids = get_admin_ids()
+    if admin_ids and update.effective_user.id not in admin_ids:
         await update.message.reply_text("❌ У тебя нет прав на рассылку")
         return
     
@@ -141,10 +157,8 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _admin_id_raw = os.environ.get("ADMIN_ID")
-    ADMIN_ID = int(_admin_id_raw) if _admin_id_raw else None
-
-    if ADMIN_ID is not None and update.effective_user.id != ADMIN_ID:
+    admin_ids = get_admin_ids()
+    if admin_ids and update.effective_user.id not in admin_ids:
         await update.message.reply_text("❌ У тебя нет прав для просмотра подписчиков")
         return
 
