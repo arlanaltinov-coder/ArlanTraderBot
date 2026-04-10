@@ -58,6 +58,26 @@ def get_all_subscribers():
         logger.error(f"❌ Ошибка при получении подписчиков: {e}")
         return []
 
+# Получение всех подписчиков в виде форматированной строки
+def get_all_subscribers_list():
+    try:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id, username, first_name, joined_at FROM subscribers ORDER BY joined_at ASC")
+                subscribers = cur.fetchall()
+        if not subscribers:
+            return "📋 Подписчиков пока нет."
+        lines = ["📋 Все подписчики:"]
+        for i, sub in enumerate(subscribers, start=1):
+            username = f"@{sub['username']}" if sub['username'] else "—"
+            name = sub['first_name'] or "—"
+            joined = sub['joined_at'].strftime("%Y-%m-%d %H:%M:%S") if sub['joined_at'] else "—"
+            lines.append(f"{i}. user_id: {sub['user_id']}, username: {username}, name: {name}, joined: {joined}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"❌ Ошибка при получении списка подписчиков: {e}")
+        return "❌ Ошибка при получении списка подписчиков."
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     name = user.first_name or "Трейдер"
@@ -119,11 +139,22 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❌ Ошибок: {failed}"
     )
 
+async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+    if ADMIN_ID and update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ У тебя нет прав для просмотра подписчиков")
+        return
+
+    subscribers_list = get_all_subscribers_list()
+    await update.message.reply_text(subscribers_list)
+
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("users", users))
     print("✅ Бот запущен...")
     app.run_polling()
 
