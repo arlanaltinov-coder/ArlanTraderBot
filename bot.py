@@ -1,7 +1,7 @@
 import os
 import logging
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -17,19 +17,17 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 # Инициализация БД
 def init_db():
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS subscribers (
-                user_id BIGINT PRIMARY KEY,
-                username VARCHAR(255),
-                first_name VARCHAR(255),
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS subscribers (
+                        user_id BIGINT PRIMARY KEY,
+                        username VARCHAR(255),
+                        first_name VARCHAR(255),
+                        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+            conn.commit()
         logger.info("✅ База данных инициализирована")
     except Exception as e:
         logger.error(f"❌ Ошибка БД: {e}")
@@ -37,28 +35,24 @@ def init_db():
 # Сохранение подписчика
 def add_subscriber(user_id, username, first_name):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO subscribers (user_id, username, first_name)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id) DO NOTHING
-        """, (user_id, username, first_name))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO subscribers (user_id, username, first_name)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, (user_id, username, first_name))
+            conn.commit()
     except Exception as e:
         logger.error(f"❌ Ошибка при сохранении: {e}")
 
 # Получение всех подписчиков
 def get_all_subscribers():
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT user_id FROM subscribers")
-        subscribers = cur.fetchall()
-        cur.close()
-        conn.close()
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM subscribers")
+                subscribers = cur.fetchall()
         return [sub['user_id'] for sub in subscribers]
     except Exception as e:
         logger.error(f"❌ Ошибка при получении подписчиков: {e}")
