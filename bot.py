@@ -105,9 +105,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Только для админа (твой ID)
-    ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-    
-    if update.effective_user.id != ADMIN_ID:
+    _admin_id_raw = os.environ.get("ADMIN_ID")
+    ADMIN_ID = int(_admin_id_raw) if _admin_id_raw else None
+
+    if ADMIN_ID is not None and update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ У тебя нет прав на рассылку")
         return
     
@@ -140,9 +141,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+    _admin_id_raw = os.environ.get("ADMIN_ID")
+    ADMIN_ID = int(_admin_id_raw) if _admin_id_raw else None
 
-    if ADMIN_ID and update.effective_user.id != ADMIN_ID:
+    if ADMIN_ID is not None and update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ У тебя нет прав для просмотра подписчиков")
         return
 
