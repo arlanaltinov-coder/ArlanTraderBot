@@ -132,9 +132,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _admin_id_raw = os.environ.get("ADMIN_ID")
-    ADMIN_ID = int(_admin_id_raw) if _admin_id_raw else None
-    is_admin = ADMIN_ID is not None and update.effective_user.id == ADMIN_ID
+    user_is_admin = is_admin(update.effective_user.id)
 
     text = (
         "📋 <b>ДОСТУПНЫЕ КОМАНДЫ:</b>\n\n"
@@ -143,9 +141,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - показать эту справку\n"
     )
 
-    if is_admin:
+    if user_is_admin:
         text += (
             "\n🔐 <b>Только для администраторов:</b>\n"
+            "/menu - панель управления рассылками\n"
             "/broadcast текст - отправить рассылку (старый способ)\n"
             "/users - показать всех подписчиков\n"
             "\n📝 <b>Система черновиков:</b>\n"
@@ -265,9 +264,9 @@ def _build_reply_markup(buttons: list) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(keyboard)
 
 
-def _draft_menu_keyboard() -> InlineKeyboardMarkup:
+def _draft_menu_keyboard(show_back: bool = False) -> InlineKeyboardMarkup:
     """Главное меню редактирования черновика."""
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("📝 Добавить текст", callback_data="draft_add_text"),
             InlineKeyboardButton("📸 Добавить фото", callback_data="draft_add_photo"),
@@ -279,12 +278,15 @@ def _draft_menu_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("❌ Отмена", callback_data="draft_cancel"),
         ],
-    ])
+    ]
+    if show_back:
+        rows.append([InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")])
+    return InlineKeyboardMarkup(rows)
 
 
-def _draft_after_edit_keyboard() -> InlineKeyboardMarkup:
+def _draft_after_edit_keyboard(show_back: bool = False) -> InlineKeyboardMarkup:
     """Кнопки после добавления контента — продолжить или предпросмотр."""
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("📝 Добавить текст", callback_data="draft_add_text"),
             InlineKeyboardButton("📸 Добавить фото", callback_data="draft_add_photo"),
@@ -296,12 +298,15 @@ def _draft_after_edit_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("❌ Отмена", callback_data="draft_cancel"),
         ],
-    ])
+    ]
+    if show_back:
+        rows.append([InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")])
+    return InlineKeyboardMarkup(rows)
 
 
-def _draft_preview_keyboard() -> InlineKeyboardMarkup:
+def _draft_preview_keyboard(show_back: bool = False) -> InlineKeyboardMarkup:
     """Кнопки под предпросмотром."""
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("✅ Отправить", callback_data="draft_send"),
             InlineKeyboardButton("✏️ Редактировать", callback_data="draft_edit_back"),
@@ -309,7 +314,10 @@ def _draft_preview_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("❌ Отмена", callback_data="draft_cancel"),
         ],
-    ])
+    ]
+    if show_back:
+        rows.append([InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _send_draft_preview(target, context: ContextTypes.DEFAULT_TYPE, draft: dict):
@@ -429,6 +437,469 @@ async def _do_send_broadcast(
         f"📤 Отправлено: {sent}\n"
         f"❌ Ошибок: {failed}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции для меню управления рассылками
+# ---------------------------------------------------------------------------
+
+def _main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура главного меню управления рассылками."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Новая рассылка", callback_data="menu_new_broadcast"),
+            InlineKeyboardButton("📊 История", callback_data="menu_history_0"),
+        ],
+        [
+            InlineKeyboardButton("👥 Подписчики", callback_data="menu_subscribers"),
+            InlineKeyboardButton("🔧 Настройки", callback_data="menu_settings"),
+        ],
+    ])
+
+
+def _get_broadcasts_page(page: int, per_page: int = 5) -> tuple[list, int]:
+    """Возвращает страницу рассылок и общее количество."""
+    try:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS cnt FROM broadcasts")
+                total = cur.fetchone()["cnt"]
+                cur.execute(
+                    """
+                    SELECT id, status, created_at, sent_at, sent_count,
+                           LEFT(text, 80) AS preview
+                    FROM broadcasts
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (per_page, page * per_page),
+                )
+                rows = cur.fetchall()
+        return rows, total
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения рассылок: {e}")
+        return [], 0
+
+
+def _get_broadcast_by_id(broadcast_id: int) -> dict | None:
+    """Возвращает рассылку по ID."""
+    try:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM broadcasts WHERE id = %s",
+                    (broadcast_id,),
+                )
+                return cur.fetchone()
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения рассылки: {e}")
+        return None
+
+
+def _delete_broadcast(broadcast_id: int) -> bool:
+    """Удаляет черновик из БД. Возвращает True при успехе."""
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM broadcasts WHERE id = %s AND status = 'draft'",
+                    (broadcast_id,),
+                )
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted > 0
+    except Exception as e:
+        logger.error(f"❌ Ошибка удаления рассылки: {e}")
+        return False
+
+
+def _get_subscribers_stats() -> dict:
+    """Возвращает статистику подписчиков."""
+    try:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS total FROM subscribers")
+                total = cur.fetchone()["total"]
+                cur.execute(
+                    """
+                    SELECT user_id, username, first_name, joined_at
+                    FROM subscribers
+                    ORDER BY joined_at DESC
+                    LIMIT 10
+                    """
+                )
+                recent = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM subscribers
+                    WHERE joined_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+                    """
+                )
+                week_count = cur.fetchone()["cnt"]
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM subscribers
+                    WHERE joined_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'
+                    """
+                )
+                month_count = cur.fetchone()["cnt"]
+        return {
+            "total": total,
+            "recent": recent,
+            "week": week_count,
+            "month": month_count,
+        }
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения статистики: {e}")
+        return {"total": 0, "recent": [], "week": 0, "month": 0}
+
+
+def _history_keyboard(rows: list, page: int, total: int, per_page: int = 5) -> InlineKeyboardMarkup:
+    """Строит клавиатуру для страницы истории рассылок."""
+    buttons = []
+
+    for r in rows:
+        status_icon = "✅" if r["status"] == "sent" else "📝"
+        created = r["created_at"].strftime("%d.%m %H:%M") if r["created_at"] else "—"
+        label = f"{status_icon} #{r['id']} {created}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"menu_bc_detail_{r['id']}")])
+
+    # Пагинация
+    total_pages = (total + per_page - 1) // per_page
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Назад", callback_data=f"menu_history_{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"menu_history_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _broadcast_detail_keyboard(broadcast_id: int, status: str) -> InlineKeyboardMarkup:
+    """Кнопки для детального просмотра рассылки."""
+    rows = [
+        [InlineKeyboardButton("✏️ Редактировать", callback_data=f"menu_bc_edit_{broadcast_id}")],
+    ]
+    if status == "draft":
+        rows.append([
+            InlineKeyboardButton("📤 Отправить", callback_data=f"menu_bc_send_{broadcast_id}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"menu_bc_delete_confirm_{broadcast_id}"),
+        ])
+    rows.append([InlineKeyboardButton("🔙 К истории", callback_data="menu_history_0")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _delete_confirm_keyboard(broadcast_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения удаления."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, удалить", callback_data=f"menu_bc_delete_yes_{broadcast_id}"),
+            InlineKeyboardButton("❌ Отмена", callback_data=f"menu_bc_detail_{broadcast_id}"),
+        ],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# /menu — главное меню управления рассылками
+# ---------------------------------------------------------------------------
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+
+    await update.message.reply_text(
+        "📋 <b>УПРАВЛЕНИЕ РАССЫЛКАМИ</b>\n\n"
+        "Выбери раздел:",
+        parse_mode="HTML",
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Обработчик inline-кнопок главного меню
+# ---------------------------------------------------------------------------
+
+async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ Нет прав.", show_alert=True)
+        return
+
+    data = query.data
+
+    # ── Главное меню ────────────────────────────────────────────────────────
+    if data == "menu_main":
+        await query.message.reply_text(
+            "📋 <b>УПРАВЛЕНИЕ РАССЫЛКАМИ</b>\n\n"
+            "Выбери раздел:",
+            parse_mode="HTML",
+            reply_markup=_main_menu_keyboard(),
+        )
+
+    # ── Новая рассылка ──────────────────────────────────────────────────────
+    elif data == "menu_new_broadcast":
+        _clear_draft(context)
+        draft = _get_draft(context)
+        try:
+            db_id = _save_draft_to_db(query.from_user.id, draft)
+            draft["db_id"] = db_id
+        except Exception as e:
+            await query.message.reply_text(f"❌ Не удалось создать черновик: {e}")
+            return
+        await query.message.reply_text(
+            "📝 <b>Новый черновик создан.</b>\n\n"
+            "Используй кнопки ниже для добавления контента:",
+            parse_mode="HTML",
+            reply_markup=_draft_menu_keyboard(show_back=True),
+        )
+
+    # ── История рассылок (с пагинацией) ────────────────────────────────────
+    elif data.startswith("menu_history_"):
+        page = int(data.split("_")[-1])
+        per_page = 5
+        rows, total = _get_broadcasts_page(page, per_page)
+
+        if not rows:
+            await query.message.reply_text(
+                "📋 Рассылок пока нет.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")]
+                ]),
+            )
+            return
+
+        total_pages = (total + per_page - 1) // per_page
+        text = (
+            f"📊 <b>История рассылок</b> (стр. {page + 1}/{total_pages}, всего: {total}):\n\n"
+        )
+        for r in rows:
+            status_icon = "✅" if r["status"] == "sent" else "📝"
+            created = r["created_at"].strftime("%d.%m.%Y %H:%M") if r["created_at"] else "—"
+            preview = (r["preview"] or "").replace("\n", " ")
+            if len(preview) == 80:
+                preview += "…"
+            sent_info = ""
+            if r["status"] == "sent" and r["sent_at"]:
+                sent_info = f" | 📤 {r['sent_at'].strftime('%d.%m %H:%M')} ({r['sent_count']} польз.)"
+            text += (
+                f"{status_icon} <b>#{r['id']}</b> [{r['status']}] {created}{sent_info}\n"
+                f"   {preview}\n\n"
+            )
+
+        await query.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=_history_keyboard(rows, page, total, per_page),
+        )
+
+    # ── Детали рассылки ─────────────────────────────────────────────────────
+    elif data.startswith("menu_bc_detail_"):
+        broadcast_id = int(data.split("_")[-1])
+        bc = _get_broadcast_by_id(broadcast_id)
+        if not bc:
+            await query.message.reply_text("❌ Рассылка не найдена.")
+            return
+
+        status_icon = "✅" if bc["status"] == "sent" else "📝"
+        created = bc["created_at"].strftime("%d.%m.%Y %H:%M") if bc["created_at"] else "—"
+        preview = (bc["text"] or "").replace("\n", " ")
+        if len(preview) > 200:
+            preview = preview[:200] + "…"
+
+        text = (
+            f"{status_icon} <b>Рассылка #{bc['id']}</b>\n\n"
+            f"📅 Создана: {created}\n"
+            f"📌 Статус: {bc['status']}\n"
+        )
+        if bc["status"] == "sent" and bc["sent_at"]:
+            text += (
+                f"📤 Отправлена: {bc['sent_at'].strftime('%d.%m.%Y %H:%M')}\n"
+                f"👥 Получателей: {bc['sent_count']}\n"
+            )
+        text += f"\n📝 Текст:\n{preview or '(нет текста)'}\n"
+        if bc["photo_file_id"]:
+            text += "🖼 Фото: есть\n"
+        buttons_data = []
+        if bc["buttons"]:
+            try:
+                buttons_data = json.loads(bc["buttons"])
+            except Exception:
+                pass
+        if buttons_data:
+            text += f"🔗 Кнопок: {len(buttons_data)}\n"
+
+        await query.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=_broadcast_detail_keyboard(bc["id"], bc["status"]),
+        )
+
+    # ── Редактировать рассылку ──────────────────────────────────────────────
+    elif data.startswith("menu_bc_edit_"):
+        broadcast_id = int(data.split("_")[-1])
+        bc = _get_broadcast_by_id(broadcast_id)
+        if not bc:
+            await query.message.reply_text("❌ Рассылка не найдена.")
+            return
+
+        _clear_draft(context)
+        draft = _get_draft(context)
+
+        buttons_data = []
+        if bc["buttons"]:
+            try:
+                buttons_data = json.loads(bc["buttons"])
+            except Exception:
+                pass
+
+        if bc["status"] == "draft":
+            # Редактируем существующий черновик
+            draft["text"] = bc["text"] or ""
+            draft["photo_file_id"] = bc["photo_file_id"]
+            draft["buttons"] = buttons_data
+            draft["db_id"] = bc["id"]
+            await query.message.reply_text(
+                f"✏️ <b>Редактирование черновика #{bc['id']}</b>\n\n"
+                "Черновик загружен. Используй кнопки для изменения:",
+                parse_mode="HTML",
+                reply_markup=_draft_menu_keyboard(show_back=True),
+            )
+        else:
+            # Создаём новый черновик на основе отправленной рассылки
+            draft["text"] = bc["text"] or ""
+            draft["photo_file_id"] = bc["photo_file_id"]
+            draft["buttons"] = buttons_data
+            draft["db_id"] = None
+            try:
+                db_id = _save_draft_to_db(query.from_user.id, draft)
+                draft["db_id"] = db_id
+            except Exception as e:
+                await query.message.reply_text(f"❌ Не удалось создать черновик: {e}")
+                return
+            await query.message.reply_text(
+                f"✏️ <b>Новый черновик на основе рассылки #{bc['id']}</b>\n\n"
+                f"Данные скопированы (новый ID: #{draft['db_id']}). Редактируй:",
+                parse_mode="HTML",
+                reply_markup=_draft_menu_keyboard(show_back=True),
+            )
+
+    # ── Отправить черновик из истории ───────────────────────────────────────
+    elif data.startswith("menu_bc_send_"):
+        broadcast_id = int(data.split("_")[-1])
+        bc = _get_broadcast_by_id(broadcast_id)
+        if not bc or bc["status"] != "draft":
+            await query.message.reply_text("❌ Черновик не найден или уже отправлен.")
+            return
+
+        buttons_data = []
+        if bc["buttons"]:
+            try:
+                buttons_data = json.loads(bc["buttons"])
+            except Exception:
+                pass
+
+        draft = {
+            "text": bc["text"] or "",
+            "photo_file_id": bc["photo_file_id"],
+            "buttons": buttons_data,
+            "db_id": bc["id"],
+        }
+        context.user_data["current_draft"] = draft
+        await _do_send_broadcast(context, query.from_user.id, draft, query.message)
+
+    # ── Подтверждение удаления ──────────────────────────────────────────────
+    elif data.startswith("menu_bc_delete_confirm_"):
+        broadcast_id = int(data.split("_")[-1])
+        bc = _get_broadcast_by_id(broadcast_id)
+        if not bc or bc["status"] != "draft":
+            await query.message.reply_text("❌ Можно удалять только черновики.")
+            return
+        await query.message.reply_text(
+            f"⚠️ <b>Удалить черновик #{broadcast_id}?</b>\n\n"
+            "Это действие необратимо.",
+            parse_mode="HTML",
+            reply_markup=_delete_confirm_keyboard(broadcast_id),
+        )
+
+    # ── Подтверждённое удаление ─────────────────────────────────────────────
+    elif data.startswith("menu_bc_delete_yes_"):
+        broadcast_id = int(data.split("_")[-1])
+        success = _delete_broadcast(broadcast_id)
+        if success:
+            # Если удалённый черновик был активным — очищаем
+            draft = context.user_data.get("current_draft")
+            if draft and draft.get("db_id") == broadcast_id:
+                _clear_draft(context)
+            await query.message.reply_text(
+                f"🗑 Черновик #{broadcast_id} удалён.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 К истории", callback_data="menu_history_0")],
+                    [InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")],
+                ]),
+            )
+        else:
+            await query.message.reply_text(
+                "❌ Не удалось удалить. Возможно, черновик уже был удалён или отправлен.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 К истории", callback_data="menu_history_0")]
+                ]),
+            )
+
+    # ── Подписчики ──────────────────────────────────────────────────────────
+    elif data == "menu_subscribers":
+        stats = _get_subscribers_stats()
+        text = (
+            f"👥 <b>Подписчики</b>\n\n"
+            f"📊 Всего: <b>{stats['total']}</b>\n"
+            f"📈 За последние 7 дней: <b>{stats['week']}</b>\n"
+            f"📅 За последние 30 дней: <b>{stats['month']}</b>\n\n"
+        )
+        if stats["recent"]:
+            text += "🕐 <b>Последние 10 подписчиков:</b>\n"
+            for i, sub in enumerate(stats["recent"], 1):
+                username = f"@{sub['username']}" if sub["username"] else "—"
+                name = sub["first_name"] or "—"
+                joined = sub["joined_at"].strftime("%d.%m.%Y %H:%M") if sub["joined_at"] else "—"
+                text += f"{i}. {name} ({username}) — {joined}\n"
+        else:
+            text += "Подписчиков пока нет."
+
+        await query.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")]
+            ]),
+        )
+
+    # ── Настройки ───────────────────────────────────────────────────────────
+    elif data == "menu_settings":
+        token = BOT_TOKEN or ""
+        masked_token = token[:8] + "****" + token[-4:] if len(token) > 12 else "****"
+        admin_ids_str = ", ".join(str(a) for a in sorted(ADMIN_IDS))
+        text = (
+            "🔧 <b>Настройки бота</b>\n\n"
+            f"👤 <b>Администраторы:</b>\n{admin_ids_str}\n\n"
+            f"🤖 <b>Токен бота:</b> <code>{masked_token}</code>\n\n"
+            f"🗄 <b>База данных:</b> PostgreSQL\n"
+            f"🔗 <b>VIP ссылка:</b> {'задана' if VIP_LINK else 'не задана'}\n"
+            f"📢 <b>Канал:</b> {'задан' if CHANNEL_LINK else 'не задан'}\n"
+        )
+        await query.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")]
+            ]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -754,11 +1225,17 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("users", users))
 
+    # Панель управления рассылками
+    app.add_handler(CommandHandler("menu", menu_command))
+
     # Управление черновиками (команды)
     app.add_handler(CommandHandler("draft_start", draft_start))
     app.add_handler(CommandHandler("draft_preview", draft_preview))
     app.add_handler(CommandHandler("draft_send", draft_send))
     app.add_handler(CommandHandler("drafts", drafts_list))
+
+    # Inline-кнопки главного меню
+    app.add_handler(CallbackQueryHandler(menu_callback_handler, pattern="^menu_"))
 
     # Inline-кнопки черновика
     app.add_handler(CallbackQueryHandler(draft_callback_handler, pattern="^draft_"))
