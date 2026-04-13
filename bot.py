@@ -103,6 +103,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _admin_id_raw = os.environ.get("ADMIN_ID")
+    ADMIN_ID = int(_admin_id_raw) if _admin_id_raw else None
+    is_admin = ADMIN_ID is not None and update.effective_user.id == ADMIN_ID
+
+    text = (
+        "📋 <b>ДОСТУПНЫЕ КОМАНДЫ:</b>\n\n"
+        "👤 <b>Для всех:</b>\n"
+        "/start - начать работу с ботом\n"
+        "/help - показать эту справку\n"
+    )
+
+    if is_admin:
+        text += (
+            "\n🔐 <b>Только для администраторов:</b>\n"
+            "/broadcast текст - отправить рассылку (старый способ)\n"
+            "/users - показать всех подписчиков\n"
+            "\n📝 <b>Система черновиков (новый способ):</b>\n"
+            "/draft_start - начать новый черновик\n"
+            "/draft_text текст - добавить текст\n"
+            "/draft_photo - загрузить фото\n"
+            "/draft_button Текст|https://ссылка - добавить кнопку\n"
+            "/draft_preview - предпросмотр\n"
+            "/draft_send - отправить всем\n"
+            "/draft_delete - удалить черновик\n"
+            "/draft_edit <id> - редактировать рассылку\n"
+            "/drafts - история всех рассылок\n"
+        )
+
+    await update.message.reply_text(text, parse_mode="HTML")
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Только для админа (твой ID)
     _admin_id_raw = os.environ.get("ADMIN_ID")
@@ -155,6 +186,7 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("users", users))
     print("✅ Бот запущен...")
