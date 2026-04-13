@@ -4,7 +4,14 @@ import logging
 import psycopg
 from psycopg.rows import dict_row
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -141,15 +148,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "\n🔐 <b>Только для администраторов:</b>\n"
             "/broadcast текст - отправить рассылку (старый способ)\n"
             "/users - показать всех подписчиков\n"
-            "\n📝 <b>Система черновиков (новый способ):</b>\n"
-            "/draft_start - начать новый черновик\n"
-            "/draft_text текст - добавить текст\n"
-            "/draft_photo - загрузить фото\n"
-            "/draft_button Текст|https://ссылка - добавить кнопку\n"
-            "/draft_preview - предпросмотр\n"
-            "/draft_send - отправить всем\n"
-            "/draft_delete - удалить черновик\n"
-            "/draft_edit <id> - редактировать рассылку\n"
+            "\n📝 <b>Система черновиков:</b>\n"
+            "/draft_start - начать новый черновик (интерактивное меню)\n"
+            "/draft_preview - предпросмотр текущего черновика\n"
+            "/draft_send - отправить черновик всем подписчикам\n"
             "/drafts - история всех рассылок\n"
         )
 
@@ -215,6 +217,9 @@ def _get_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 def _clear_draft(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("current_draft", None)
+    context.user_data.pop("waiting_for_photo", None)
+    context.user_data.pop("waiting_for_text", None)
+    context.user_data.pop("waiting_for_button", None)
 
 
 def _save_draft_to_db(admin_id: int, draft: dict) -> int:
@@ -260,170 +265,79 @@ def _build_reply_markup(buttons: list) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(keyboard)
 
 
-# ---------------------------------------------------------------------------
-# /draft_start — начать новый черновик
-# ---------------------------------------------------------------------------
-
-async def draft_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Нет прав.")
-        return
-
-    _clear_draft(context)
-    _get_draft(context)  # создаём пустой
-    await update.message.reply_text(
-        "✏️ <b>Новый черновик создан.</b>\n\n"
-        "Доступные команды:\n"
-        "• /draft_text &lt;текст&gt; — добавить/дополнить текст\n"
-        "• /draft_photo — отправь фото следующим сообщением\n"
-        "• /draft_button Текст|https://ссылка — добавить кнопку\n"
-        "• /draft_preview — предпросмотр\n"
-        "• /draft_send — отправить всем подписчикам\n"
-        "• /draft_delete — удалить черновик",
-        parse_mode="HTML",
-    )
+def _draft_menu_keyboard() -> InlineKeyboardMarkup:
+    """Главное меню редактирования черновика."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Добавить текст", callback_data="draft_add_text"),
+            InlineKeyboardButton("📸 Добавить фото", callback_data="draft_add_photo"),
+        ],
+        [
+            InlineKeyboardButton("🔗 Добавить кнопку", callback_data="draft_add_button"),
+            InlineKeyboardButton("👁️ Предпросмотр", callback_data="draft_preview"),
+        ],
+        [
+            InlineKeyboardButton("❌ Отмена", callback_data="draft_cancel"),
+        ],
+    ])
 
 
-# ---------------------------------------------------------------------------
-# /draft_text — добавить текст (многострочный, накапливается)
-# ---------------------------------------------------------------------------
-
-async def draft_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Нет прав.")
-        return
-
-    # Берём весь текст после команды, включая переносы строк
-    full_text = update.message.text or ""
-    # Убираем первое слово-команду (/draft_text)
-    parts = full_text.split(None, 1)
-    if len(parts) < 2 or not parts[1].strip():
-        await update.message.reply_text("📝 Использование: /draft_text ваш текст")
-        return
-
-    new_text = parts[1]
-    draft = _get_draft(context)
-
-    if draft["text"]:
-        draft["text"] += "\n" + new_text
-    else:
-        draft["text"] = new_text
-
-    char_count = len(draft["text"])
-    await update.message.reply_text(
-        f"✅ Текст добавлен. Всего символов: {char_count}\n"
-        f"Используй /draft_text снова, чтобы дополнить, или /draft_preview для предпросмотра."
-    )
+def _draft_after_edit_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки после добавления контента — продолжить или предпросмотр."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Добавить текст", callback_data="draft_add_text"),
+            InlineKeyboardButton("📸 Добавить фото", callback_data="draft_add_photo"),
+        ],
+        [
+            InlineKeyboardButton("🔗 Добавить кнопку", callback_data="draft_add_button"),
+            InlineKeyboardButton("👁️ Предпросмотр", callback_data="draft_preview"),
+        ],
+        [
+            InlineKeyboardButton("❌ Отмена", callback_data="draft_cancel"),
+        ],
+    ])
 
 
-# ---------------------------------------------------------------------------
-# /draft_photo — ожидаем следующее фото от админа
-# ---------------------------------------------------------------------------
-
-async def draft_photo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Нет прав.")
-        return
-
-    context.user_data["waiting_for_photo"] = True
-    await update.message.reply_text("📷 Отправь фото следующим сообщением.")
-
-
-async def draft_photo_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик входящих фото — сохраняет file_id в черновик."""
-    if not is_admin(update.effective_user.id):
-        return
-
-    if not context.user_data.get("waiting_for_photo"):
-        return
-
-    photo = update.message.photo[-1]  # берём наибольшее разрешение
-    draft = _get_draft(context)
-    draft["photo_file_id"] = photo.file_id
-    context.user_data["waiting_for_photo"] = False
-
-    await update.message.reply_text(
-        "✅ Фото сохранено в черновик.\n"
-        "Используй /draft_preview для предпросмотра."
-    )
+def _draft_preview_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки под предпросмотром."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Отправить", callback_data="draft_send"),
+            InlineKeyboardButton("✏️ Редактировать", callback_data="draft_edit_back"),
+        ],
+        [
+            InlineKeyboardButton("❌ Отмена", callback_data="draft_cancel"),
+        ],
+    ])
 
 
-# ---------------------------------------------------------------------------
-# /draft_button Текст|https://ссылка — добавить кнопку
-# ---------------------------------------------------------------------------
-
-async def draft_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Нет прав.")
-        return
-
-    full_text = update.message.text or ""
-    parts = full_text.split(None, 1)
-    if len(parts) < 2 or "|" not in parts[1]:
-        await update.message.reply_text(
-            "📝 Использование: /draft_button Текст кнопки|https://ссылка\n"
-            "Пример: /draft_button НАПИСАТЬ|https://t.me/username"
-        )
-        return
-
-    btn_part = parts[1].strip()
-    pipe_idx = btn_part.index("|")
-    btn_text = btn_part[:pipe_idx].strip()
-    btn_url = btn_part[pipe_idx + 1:].strip()
-
-    if not btn_text or not btn_url:
-        await update.message.reply_text("❌ Текст и ссылка не могут быть пустыми.")
-        return
-
-    draft = _get_draft(context)
-    draft["buttons"].append({"text": btn_text, "url": btn_url})
-
-    total = len(draft["buttons"])
-    await update.message.reply_text(
-        f"✅ Кнопка добавлена: <b>{btn_text}</b> → {btn_url}\n"
-        f"Всего кнопок: {total}",
-        parse_mode="HTML",
-    )
-
-
-# ---------------------------------------------------------------------------
-# /draft_preview — предпросмотр черновика
-# ---------------------------------------------------------------------------
-
-async def draft_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Нет прав.")
-        return
-
-    draft = _get_draft(context)
-
-    if not draft["text"] and not draft["photo_file_id"]:
-        await update.message.reply_text(
-            "⚠️ Черновик пуст. Начни с /draft_start, затем добавь текст или фото."
-        )
-        return
-
-    reply_markup = _build_reply_markup(draft["buttons"])
+async def _send_draft_preview(target, context: ContextTypes.DEFAULT_TYPE, draft: dict):
+    """
+    Отправляет предпросмотр черновика.
+    target — объект с методами reply_text / reply_photo (Message или CallbackQuery.message).
+    """
+    reply_markup_content = _build_reply_markup(draft["buttons"])
     text = draft["text"] or ""
 
-    await update.message.reply_text("👁 <b>Предпросмотр рассылки:</b>", parse_mode="HTML")
+    await target.reply_text("👁️ <b>Предпросмотр рассылки:</b>", parse_mode="HTML")
 
     try:
         if draft["photo_file_id"]:
-            await update.message.reply_photo(
+            await target.reply_photo(
                 photo=draft["photo_file_id"],
                 caption=text if text else None,
                 parse_mode="HTML",
-                reply_markup=reply_markup,
+                reply_markup=reply_markup_content,
             )
         else:
-            await update.message.reply_text(
+            await target.reply_text(
                 text,
                 parse_mode="HTML",
-                reply_markup=reply_markup,
+                reply_markup=reply_markup_content,
             )
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка предпросмотра: {e}")
+        await target.reply_text(f"❌ Ошибка предпросмотра: {e}")
         return
 
     btn_lines = "\n".join(
@@ -434,40 +348,35 @@ async def draft_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Текст: {'есть (' + str(len(text)) + ' симв.)' if text else 'нет'}\n"
         f"• Фото: {'есть' if draft['photo_file_id'] else 'нет'}\n"
         f"• Кнопки ({len(draft['buttons'])}):\n{btn_lines if btn_lines else '  нет'}\n\n"
-        f"Готово? Отправь /draft_send"
+        f"Что делаем дальше?"
     )
-    await update.message.reply_text(summary, parse_mode="HTML")
+    await target.reply_text(
+        summary,
+        parse_mode="HTML",
+        reply_markup=_draft_preview_keyboard(),
+    )
 
 
-# ---------------------------------------------------------------------------
-# /draft_send — отправить рассылку всем подписчикам
-# ---------------------------------------------------------------------------
-
-async def draft_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Нет прав.")
-        return
-
-    draft = _get_draft(context)
-
-    if not draft["text"] and not draft["photo_file_id"]:
-        await update.message.reply_text("⚠️ Черновик пуст. Нечего отправлять.")
-        return
-
+async def _do_send_broadcast(
+    context: ContextTypes.DEFAULT_TYPE,
+    admin_id: int,
+    draft: dict,
+    reply_target,
+):
+    """Выполняет рассылку и обновляет БД. reply_target — Message для ответа."""
     subscribers = get_all_subscribers()
     if not subscribers:
-        await update.message.reply_text("❌ Нет подписчиков.")
+        await reply_target.reply_text("❌ Нет подписчиков.")
         return
 
-    # Сохраняем черновик в БД перед отправкой
     try:
-        db_id = _save_draft_to_db(update.effective_user.id, draft)
+        db_id = _save_draft_to_db(admin_id, draft)
         draft["db_id"] = db_id
     except Exception as e:
-        await update.message.reply_text(f"❌ Не удалось сохранить в БД: {e}")
+        await reply_target.reply_text(f"❌ Не удалось сохранить в БД: {e}")
         return
 
-    await update.message.reply_text(
+    await reply_target.reply_text(
         f"🚀 Начинаю рассылку для {len(subscribers)} подписчиков..."
     )
 
@@ -498,7 +407,6 @@ async def draft_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Ошибка отправки {user_id}: {e}")
             failed += 1
 
-    # Обновляем статус в БД
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
@@ -516,7 +424,7 @@ async def draft_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _clear_draft(context)
 
-    await update.message.reply_text(
+    await reply_target.reply_text(
         f"✅ Рассылка завершена (ID: {db_id})\n"
         f"📤 Отправлено: {sent}\n"
         f"❌ Ошибок: {failed}"
@@ -524,90 +432,263 @@ async def draft_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# /draft_delete — удалить текущий черновик (из памяти и БД если сохранён)
+# /draft_start — начать новый черновик
 # ---------------------------------------------------------------------------
 
-async def draft_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def draft_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Нет прав.")
         return
 
-    draft = context.user_data.get("current_draft")
-    if not draft:
-        await update.message.reply_text("⚠️ Активного черновика нет.")
-        return
-
-    db_id = draft.get("db_id")
-    if db_id:
-        try:
-            with psycopg.connect(DATABASE_URL) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "DELETE FROM broadcasts WHERE id = %s AND status = 'draft'",
-                        (db_id,),
-                    )
-                conn.commit()
-        except Exception as e:
-            logger.error(f"❌ Ошибка удаления черновика из БД: {e}")
-
     _clear_draft(context)
-    await update.message.reply_text("🗑 Черновик удалён.")
 
-
-# ---------------------------------------------------------------------------
-# /draft_edit <id> — загрузить отправленную/сохранённую рассылку для редактирования
-# ---------------------------------------------------------------------------
-
-async def draft_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Нет прав.")
-        return
-
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("📝 Использование: /draft_edit <id>")
-        return
-
-    broadcast_id = int(context.args[0])
-
-    try:
-        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM broadcasts WHERE id = %s",
-                    (broadcast_id,),
-                )
-                row = cur.fetchone()
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка БД: {e}")
-        return
-
-    if not row:
-        await update.message.reply_text(f"❌ Рассылка #{broadcast_id} не найдена.")
-        return
-
-    buttons = []
-    if row["buttons"]:
-        try:
-            buttons = json.loads(row["buttons"])
-        except json.JSONDecodeError:
-            buttons = []
-
-    _clear_draft(context)
+    # Создаём запись в БД сразу, чтобы иметь db_id
     draft = _get_draft(context)
-    draft["text"] = row["text"] or ""
-    draft["photo_file_id"] = row["photo_file_id"]
-    draft["buttons"] = buttons
-    draft["db_id"] = row["id"]
+    try:
+        db_id = _save_draft_to_db(update.effective_user.id, draft)
+        draft["db_id"] = db_id
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось создать черновик в БД: {e}")
+        return
 
     await update.message.reply_text(
-        f"✏️ Рассылка <b>#{broadcast_id}</b> загружена для редактирования.\n\n"
-        f"• Текст: {'есть (' + str(len(draft['text'])) + ' симв.)' if draft['text'] else 'нет'}\n"
-        f"• Фото: {'есть' if draft['photo_file_id'] else 'нет'}\n"
-        f"• Кнопок: {len(draft['buttons'])}\n\n"
-        f"Используй /draft_text, /draft_photo, /draft_button для изменений,\n"
-        f"затем /draft_preview и /draft_send для повторной отправки.",
+        "📝 <b>Новый черновик создан.</b> Отправляй сообщения:",
         parse_mode="HTML",
+        reply_markup=_draft_menu_keyboard(),
     )
+
+
+# ---------------------------------------------------------------------------
+# /draft_preview — предпросмотр (команда)
+# ---------------------------------------------------------------------------
+
+async def draft_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+
+    draft = _get_draft(context)
+
+    if not draft["text"] and not draft["photo_file_id"]:
+        await update.message.reply_text(
+            "⚠️ Черновик пуст. Начни с /draft_start, затем добавь текст или фото.",
+            reply_markup=_draft_menu_keyboard(),
+        )
+        return
+
+    await _send_draft_preview(update.message, context, draft)
+
+
+# ---------------------------------------------------------------------------
+# /draft_send — отправить рассылку (команда)
+# ---------------------------------------------------------------------------
+
+async def draft_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+
+    draft = _get_draft(context)
+
+    if not draft["text"] and not draft["photo_file_id"]:
+        await update.message.reply_text("⚠️ Черновик пуст. Нечего отправлять.")
+        return
+
+    await _do_send_broadcast(context, update.effective_user.id, draft, update.message)
+
+
+# ---------------------------------------------------------------------------
+# Обработчик входящих текстовых сообщений от админа (пока активен черновик)
+# ---------------------------------------------------------------------------
+
+async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимает текст от админа когда черновик активен."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    # Режим ожидания текста для черновика
+    if context.user_data.get("waiting_for_text"):
+        context.user_data["waiting_for_text"] = False
+        new_text = update.message.text or ""
+        draft = _get_draft(context)
+
+        if draft["text"]:
+            draft["text"] += "\n" + new_text
+        else:
+            draft["text"] = new_text
+
+        char_count = len(draft["text"])
+        await update.message.reply_text(
+            f"✅ Текст добавлен ({char_count} симв.).",
+            reply_markup=_draft_after_edit_keyboard(),
+        )
+        return
+
+    # Режим ожидания текста кнопки (формат "Текст|https://ссылка")
+    if context.user_data.get("waiting_for_button"):
+        context.user_data["waiting_for_button"] = False
+        raw = (update.message.text or "").strip()
+
+        if "|" not in raw:
+            await update.message.reply_text(
+                "❌ Неверный формат. Нужно: <b>Текст кнопки|https://ссылка</b>\n"
+                "Попробуй ещё раз — нажми «🔗 Добавить кнопку».",
+                parse_mode="HTML",
+                reply_markup=_draft_after_edit_keyboard(),
+            )
+            return
+
+        pipe_idx = raw.index("|")
+        btn_text = raw[:pipe_idx].strip()
+        btn_url = raw[pipe_idx + 1:].strip()
+
+        if not btn_text or not btn_url:
+            await update.message.reply_text(
+                "❌ Текст и ссылка не могут быть пустыми.\n"
+                "Попробуй ещё раз — нажми «🔗 Добавить кнопку».",
+                reply_markup=_draft_after_edit_keyboard(),
+            )
+            return
+
+        draft = _get_draft(context)
+        draft["buttons"].append({"text": btn_text, "url": btn_url})
+
+        await update.message.reply_text(
+            f"✅ Кнопка добавлена: <b>{btn_text}</b> → {btn_url}\n"
+            f"Всего кнопок: {len(draft['buttons'])}",
+            parse_mode="HTML",
+            reply_markup=_draft_after_edit_keyboard(),
+        )
+        return
+
+    # Если черновик активен — добавляем текст автоматически
+    if "current_draft" in context.user_data:
+        new_text = update.message.text or ""
+        draft = _get_draft(context)
+
+        if draft["text"]:
+            draft["text"] += "\n" + new_text
+        else:
+            draft["text"] = new_text
+
+        char_count = len(draft["text"])
+        await update.message.reply_text(
+            f"✅ Текст добавлен ({char_count} симв.).",
+            reply_markup=_draft_after_edit_keyboard(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Обработчик входящих фото от админа (пока активен черновик)
+# ---------------------------------------------------------------------------
+
+async def admin_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимает фото от админа когда черновик активен."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.user_data.get("waiting_for_photo") and "current_draft" not in context.user_data:
+        return
+
+    photo = update.message.photo[-1]  # наибольшее разрешение
+    draft = _get_draft(context)
+    draft["photo_file_id"] = photo.file_id
+    context.user_data["waiting_for_photo"] = False
+
+    await update.message.reply_text(
+        "✅ Фото сохранено в черновик.",
+        reply_markup=_draft_after_edit_keyboard(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Обработчик нажатий на inline-кнопки черновика
+# ---------------------------------------------------------------------------
+
+async def draft_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ Нет прав.", show_alert=True)
+        return
+
+    data = query.data
+
+    # ── Добавить текст ──────────────────────────────────────────────────────
+    if data == "draft_add_text":
+        context.user_data["waiting_for_text"] = True
+        context.user_data["waiting_for_photo"] = False
+        context.user_data["waiting_for_button"] = False
+        await query.message.reply_text(
+            "📝 Отправь текст следующим сообщением.\n"
+            "Он будет добавлен к черновику."
+        )
+
+    # ── Добавить фото ───────────────────────────────────────────────────────
+    elif data == "draft_add_photo":
+        context.user_data["waiting_for_photo"] = True
+        context.user_data["waiting_for_text"] = False
+        context.user_data["waiting_for_button"] = False
+        await query.message.reply_text(
+            "📸 Отправь фото следующим сообщением."
+        )
+
+    # ── Добавить кнопку ─────────────────────────────────────────────────────
+    elif data == "draft_add_button":
+        context.user_data["waiting_for_button"] = True
+        context.user_data["waiting_for_text"] = False
+        context.user_data["waiting_for_photo"] = False
+        await query.message.reply_text(
+            "🔗 Отправь кнопку в формате:\n"
+            "<b>Текст кнопки|https://ссылка</b>\n\n"
+            "Пример: <code>Написать мне|https://t.me/username</code>",
+            parse_mode="HTML",
+        )
+
+    # ── Предпросмотр ────────────────────────────────────────────────────────
+    elif data == "draft_preview":
+        draft = _get_draft(context)
+        if not draft["text"] and not draft["photo_file_id"]:
+            await query.message.reply_text(
+                "⚠️ Черновик пуст. Сначала добавь текст или фото.",
+                reply_markup=_draft_menu_keyboard(),
+            )
+            return
+        await _send_draft_preview(query.message, context, draft)
+
+    # ── Вернуться к редактированию ──────────────────────────────────────────
+    elif data == "draft_edit_back":
+        await query.message.reply_text(
+            "✏️ Продолжай редактировать черновик:",
+            reply_markup=_draft_menu_keyboard(),
+        )
+
+    # ── Отправить рассылку ──────────────────────────────────────────────────
+    elif data == "draft_send":
+        draft = _get_draft(context)
+        if not draft["text"] and not draft["photo_file_id"]:
+            await query.message.reply_text("⚠️ Черновик пуст. Нечего отправлять.")
+            return
+        await _do_send_broadcast(context, query.from_user.id, draft, query.message)
+
+    # ── Отмена ──────────────────────────────────────────────────────────────
+    elif data == "draft_cancel":
+        draft = context.user_data.get("current_draft")
+        db_id = draft.get("db_id") if draft else None
+        if db_id:
+            try:
+                with psycopg.connect(DATABASE_URL) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM broadcasts WHERE id = %s AND status = 'draft'",
+                            (db_id,),
+                        )
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"❌ Ошибка удаления черновика из БД: {e}")
+        _clear_draft(context)
+        await query.message.reply_text("🗑 Черновик отменён.")
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +738,6 @@ async def drafts_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     text = "\n\n".join(lines)
-    # Telegram limit 4096 chars
     if len(text) > 4000:
         text = text[:4000] + "\n…(обрезано)"
 
@@ -674,20 +754,26 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("users", users))
 
-    # Управление черновиками
+    # Управление черновиками (команды)
     app.add_handler(CommandHandler("draft_start", draft_start))
-    app.add_handler(CommandHandler("draft_text", draft_text))
-    app.add_handler(CommandHandler("draft_photo", draft_photo_cmd))
-    app.add_handler(CommandHandler("draft_button", draft_button))
     app.add_handler(CommandHandler("draft_preview", draft_preview))
     app.add_handler(CommandHandler("draft_send", draft_send))
-    app.add_handler(CommandHandler("draft_delete", draft_delete))
-    app.add_handler(CommandHandler("draft_edit", draft_edit))
     app.add_handler(CommandHandler("drafts", drafts_list))
 
-    # Обработчик входящих фото (для /draft_photo)
+    # Inline-кнопки черновика
+    app.add_handler(CallbackQueryHandler(draft_callback_handler, pattern="^draft_"))
+
+    # Входящие фото от админа (для черновика)
     app.add_handler(
-        MessageHandler(filters.PHOTO & filters.User(list(ADMIN_IDS)), draft_photo_receive)
+        MessageHandler(filters.PHOTO & filters.User(list(ADMIN_IDS)), admin_photo_handler)
+    )
+
+    # Входящие текстовые сообщения от админа (для черновика)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.User(list(ADMIN_IDS)),
+            admin_message_handler,
+        )
     )
 
     print("✅ Бот запущен...")
