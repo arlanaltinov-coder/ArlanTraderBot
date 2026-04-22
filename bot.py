@@ -297,22 +297,10 @@ def _save_draft_to_db(admin_id: int, draft: dict) -> int:
 
 
 def _build_reply_markup(buttons: list) -> InlineKeyboardMarkup | None:
+    """Строит InlineKeyboardMarkup из списка кнопок [{text, url}, ...]."""
     if not buttons:
         return None
-
-    keyboard = []
-    row = []
-
-    for i, b in enumerate(buttons, 1):
-        row.append(InlineKeyboardButton(b["text"], url=b["url"]))
-
-        if i % 2 == 0:
-            keyboard.append(row)
-            row = []
-
-    if row:
-        keyboard.append(row)
-
+    keyboard = [[InlineKeyboardButton(b["text"], url=b["url"])] for b in buttons]
     return InlineKeyboardMarkup(keyboard)
 
 
