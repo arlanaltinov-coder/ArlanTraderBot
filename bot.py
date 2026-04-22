@@ -959,27 +959,39 @@ async def draft_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принимает текст от админа когда черновик активен — добавляет автоматически."""
+    """Улучшенный обработчик текста: автоматически распознаёт кнопки"""
     if not is_admin(update.effective_user.id):
         return
-
     if "current_draft" not in context.user_data:
         return
 
-    new_text = update.message.text or ""
     draft = _get_draft(context)
+    message_text = update.message.text or ""
 
-    if draft["text"]:
-        draft["text"] += "\n" + new_text
-    else:
-        draft["text"] = new_text
+    # Парсим кнопки из сообщения
+    clean_text, new_buttons = _parse_buttons_from_text(message_text)
+
+    # Добавляем чистый текст
+    if clean_text:
+        if draft["text"]:
+            draft["text"] += "\n\n" + clean_text
+        else:
+            draft["text"] = clean_text
+
+    # Добавляем новые кнопки
+    if new_buttons:
+        draft["buttons"].extend(new_buttons)
 
     context.user_data["draft_unsaved_changes"] = True
-    char_count = len(draft["text"])
-    await update.message.reply_text(
-        f"✅ Текст добавлен ({char_count} символов)",
-        reply_markup=_draft_keyboard(),
-    )
+
+    # Сообщение пользователю
+    reply_text = "✅ Добавлено в черновик:\n"
+    if clean_text:
+        reply_text += f"• Текст ({len(clean_text)} символов)\n"
+    if new_buttons:
+        reply_text += f"• {len(new_buttons)} кнопка(и)\n"
+
+    await update.message.reply_text(reply_text, reply_markup=_draft_keyboard())
 
 
 # ---------------------------------------------------------------------------
