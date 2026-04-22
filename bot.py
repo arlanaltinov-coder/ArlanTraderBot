@@ -223,21 +223,43 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def _get_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    """Возвращает текущий черновик из user_data, создаёт пустой если нет."""
+    """Возвращает текущий черновик из user_data"""
     if "current_draft" not in context.user_data:
         context.user_data["current_draft"] = {
             "text": "",
             "photo_file_id": None,
-            "buttons": [],
+            "buttons": [],          # список кнопок: [{"text": "...", "url": "..."}]
             "db_id": None,
         }
     return context.user_data["current_draft"]
 
 
 def _clear_draft(context: ContextTypes.DEFAULT_TYPE):
+    """Очищает текущий черновик"""
     context.user_data.pop("current_draft", None)
     context.user_data.pop("draft_unsaved_changes", None)
-
+    context.user_data.pop("waiting_for_button", None)
+    
+def _clear_draft(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("current_draft", None)
+    context.user_data.pop("draft_unsaved_changes", None)
+def _parse_buttons_from_text(text: str) -> tuple[str, list]:
+    """Разбирает текст и автоматически вытаскивает кнопки формата:
+    Название кнопки | https://ссылка"""
+    lines = text.split("\n")
+    clean_text = []
+    buttons = []
+    
+    for line in lines:
+        line = line.strip()
+        if "|" in line:
+            parts = [x.strip() for x in line.split("|", 1)]
+            if len(parts) == 2 and (parts[1].startswith("http") or "t.me" in parts[1]):
+                buttons.append({"text": parts[0], "url": parts[1]})
+                continue        # эту строку пропускаем, она стала кнопкой
+        clean_text.append(line)
+    
+    return "\n".join(clean_text).strip(), buttons
 
 def _save_draft_to_db(admin_id: int, draft: dict) -> int:
     """Сохраняет черновик в БД и возвращает его id."""
