@@ -51,6 +51,14 @@ def init_db():
                         ON subscribers (joined_at)
                 """)
                 cur.execute("""
+                    ALTER TABLE subscribers
+                        ADD COLUMN IF NOT EXISTS last_activity TIMESTAMP
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_subscribers_last_activity
+                        ON subscribers (last_activity)
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS broadcasts (
                         id             SERIAL PRIMARY KEY,
                         admin_id       BIGINT,
@@ -85,13 +93,28 @@ def add_subscriber(user_id: int, username: str | None, first_name: str | None):
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO subscribers (user_id, username, first_name)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (user_id) DO NOTHING
+                    INSERT INTO subscribers (user_id, username, first_name, last_activity)
+                    VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (user_id) DO UPDATE
+                        SET last_activity = CURRENT_TIMESTAMP
                 """, (user_id, username, first_name))
             conn.commit()
     except Exception as e:
         logger.error(f"❌ Ошибка при сохранении подписчика: {e}")
+
+
+def update_last_activity(user_id: int):
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE subscribers
+                    SET last_activity = CURRENT_TIMESTAMP
+                    WHERE user_id = %s
+                """, (user_id,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"❌ Ошибка при обновлении last_activity: {e}")
 
 
 def get_all_subscribers() -> list[int]:
@@ -161,6 +184,42 @@ def _get_subscribers_stats() -> dict:
     except Exception as e:
         logger.error(f"❌ Ошибка получения статистики: {e}")
         return {"total": 0, "recent": [], "week": 0, "month": 0}
+
+
+def _get_active_users_stats() -> dict:
+    try:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS total FROM subscribers")
+                total = cur.fetchone()["total"]
+
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM subscribers "
+                    "WHERE last_activity >= CURRENT_DATE"
+                )
+                today_count = cur.fetchone()["cnt"]
+
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM subscribers "
+                    "WHERE last_activity >= CURRENT_TIMESTAMP - INTERVAL '7 days'"
+                )
+                week_count = cur.fetchone()["cnt"]
+
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM subscribers "
+                    "WHERE last_activity >= CURRENT_TIMESTAMP - INTERVAL '30 days'"
+                )
+                month_count = cur.fetchone()["cnt"]
+
+        return {
+            "total": total,
+            "today": today_count,
+            "week": week_count,
+            "month": month_count,
+        }
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения статистики активных пользователей: {e}")
+        return {"total": 0, "today": 0, "week": 0, "month": 0}
 
 
 # ── Draft helpers ─────────────────────────────────────────────────────────────
@@ -428,6 +487,9 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("👥 Подписчики", callback_data="menu_subscribers"),
             InlineKeyboardButton("🔧 Настройки", callback_data="menu_settings"),
         ],
+        [
+            InlineKeyboardButton("🟢 Активные пользователи", callback_data="menu_active_users"),
+        ],
     ])
 
 
@@ -533,6 +595,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = user.first_name or "Трейдер"
 
     add_subscriber(user.id, user.username, user.first_name)
+    update_last_activity(user.id)
 
     text = (
         f"👋 Привет, <b>{name}</b>!\n\n"
@@ -566,6 +629,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    update_last_activity(update.effective_user.id)
     user_is_admin = is_admin(update.effective_user.id)
 
     text = (
@@ -582,6 +646,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/broadcast текст - отправить рассылку (быстрый способ)\n"
             "/users - показать всех подписчиков\n"
             "/stats - статистика подписчиков\n"
+            "/active - активные пользователи\n"
             "\n📝 <b>Система черновиков:</b>\n"
             "/draft_start - начать новый черновик\n"
             "/draft_preview - предпросмотр текущего черновика\n"
@@ -628,6 +693,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ У тебя нет прав для просмотра подписчиков")
@@ -646,11 +712,16 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     stats = _get_subscribers_stats()
+    active = _get_active_users_stats()
     text = (
         f"📊 <b>Статистика подписчиков</b>\n\n"
         f"👥 Всего: <b>{stats['total']}</b>\n"
         f"📈 За последние 7 дней: <b>{stats['week']}</b>\n"
-        f"📅 За последние 30 дней: <b>{stats['month']}</b>\n"
+        f"📅 За последние 30 дней: <b>{stats['month']}</b>\n\n"
+        f"🟢 <b>Активные пользователи</b>\n"
+        f"🟢 Активны сегодня: <b>{active['today']}</b>\n"
+        f"📈 Активны за 7 дней: <b>{active['week']}</b>\n"
+        f"📅 Активны за 30 дней: <b>{active['month']}</b>\n"
     )
     if stats["recent"]:
         text += "\n🕐 <b>Последние 10 подписчиков:</b>\n"
@@ -668,11 +739,29 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет прав.")
         return
 
+    update_last_activity(update.effective_user.id)
     await update.message.reply_text(
         "📋 <b>УПРАВЛЕНИЕ РАССЫЛКАМИ</b>\n\nВыбери раздел:",
         parse_mode="HTML",
         reply_markup=_main_menu_keyboard(),
     )
+
+
+
+async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+
+    active = _get_active_users_stats()
+    text = (
+        f"📊 Активные пользователи\n\n"
+        f"👥 Всего подписчиков: <b>{active['total']}</b>\n"
+        f"🟢 Активны сегодня: <b>{active['today']}</b>\n"
+        f"📈 Активны за 7 дней: <b>{active['week']}</b>\n"
+        f"📅 Активны за 30 дней: <b>{active['month']}</b>\n"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def draft_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1049,6 +1138,25 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             ]),
         )
 
+    # ── Active users ──────────────────────────────────────────────────────────
+    elif data == "menu_active_users":
+        active = _get_active_users_stats()
+        text = (
+            f"📊 Активные пользователи\n\n"
+            f"👥 Всего подписчиков: <b>{active['total']}</b>\n"
+            f"🟢 Активны сегодня: <b>{active['today']}</b>\n"
+            f"📈 Активны за 7 дней: <b>{active['week']}</b>\n"
+            f"📅 Активны за 30 дней: <b>{active['month']}</b>\n"
+        )
+        await query.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")]
+            ]),
+        )
+
+
 
 async def draft_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1164,6 +1272,8 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_admin(update.effective_user.id):
         return
 
+    update_last_activity(update.effective_user.id)
+
     if "current_draft" not in context.user_data:
         return
 
@@ -1197,6 +1307,8 @@ async def admin_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_admin(update.effective_user.id):
         return
 
+    update_last_activity(update.effective_user.id)
+
     if "current_draft" not in context.user_data:
         return
 
@@ -1223,6 +1335,7 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("users", users))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("active", active_command))
 
     # Admin panel
     app.add_handler(CommandHandler("menu", menu_command))
