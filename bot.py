@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import psycopg
@@ -54,6 +55,18 @@ def init_db():
                         sent_at TIMESTAMP,
                         sent_count INT DEFAULT 0
                     )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_subscribers_joined_at
+                    ON subscribers (joined_at)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_broadcasts_status
+                    ON broadcasts (status)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_broadcasts_created_at
+                    ON broadcasts (created_at DESC)
                 """)
             conn.commit()
         logger.info("✅ База данных инициализирована")
@@ -239,27 +252,55 @@ def _clear_draft(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("current_draft", None)
     context.user_data.pop("draft_unsaved_changes", None)
     context.user_data.pop("waiting_for_button", None)
-    
-def _clear_draft(context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("current_draft", None)
-    context.user_data.pop("draft_unsaved_changes", None)
+
+
 def _parse_buttons_from_text(text: str) -> tuple[str, list]:
-    """Разбирает текст и автоматически вытаскивает кнопки формата:
-    Название кнопки | https://ссылка"""
+    """Разбирает текст и автоматически вытаскивает кнопки в трёх форматах:
+    1. [Text|https://url]       — bracket-pipe format
+    2. [Text](https://url)      — Markdown link format
+    3. Text | https://url       — plain pipe format (whole line)
+    """
     lines = text.split("\n")
     clean_text = []
     buttons = []
-    
+
+    # Regex patterns for inline button formats (can appear anywhere in a line)
+    bracket_pipe_re = re.compile(r'\[([^\[\]|]+)\|(https?://[^\]]+)\]')
+    markdown_link_re = re.compile(r'\[([^\[\]]+)\]\((https?://[^\)]+)\)')
+
     for line in lines:
-        line = line.strip()
-        if "|" in line:
-            parts = [x.strip() for x in line.split("|", 1)]
+        stripped = line.strip()
+
+        # 1. [Text|https://url] — bracket pipe format
+        m = bracket_pipe_re.search(stripped)
+        if m:
+            buttons.append({"text": m.group(1).strip(), "url": m.group(2).strip()})
+            # Remove the matched button syntax from the line; keep any remaining text
+            remainder = bracket_pipe_re.sub("", stripped).strip()
+            if remainder:
+                clean_text.append(remainder)
+            continue
+
+        # 2. [Text](https://url) — Markdown link format
+        m = markdown_link_re.search(stripped)
+        if m:
+            buttons.append({"text": m.group(1).strip(), "url": m.group(2).strip()})
+            remainder = markdown_link_re.sub("", stripped).strip()
+            if remainder:
+                clean_text.append(remainder)
+            continue
+
+        # 3. Text | https://url — plain pipe format (entire line is a button)
+        if "|" in stripped:
+            parts = [x.strip() for x in stripped.split("|", 1)]
             if len(parts) == 2 and (parts[1].startswith("http") or "t.me" in parts[1]):
                 buttons.append({"text": parts[0], "url": parts[1]})
-                continue        # эту строку пропускаем, она стала кнопкой
+                continue
+
         clean_text.append(line)
-    
+
     return "\n".join(clean_text).strip(), buttons
+
 
 def _save_draft_to_db(admin_id: int, draft: dict) -> int:
     """Сохраняет черновик в БД и возвращает его id."""
@@ -304,9 +345,26 @@ def _build_reply_markup(buttons: list) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(keyboard)
 
 
-def _draft_keyboard() -> InlineKeyboardMarkup:
-    """Единственная клавиатура для работы с черновиком."""
-    return InlineKeyboardMarkup([
+def _draft_status_text(draft: dict) -> str:
+    """Возвращает строку с текущим состоянием черновика."""
+    parts = []
+    if draft.get("text"):
+        parts.append(f"📝 Текст: {len(draft['text'])} символов")
+    else:
+        parts.append("📝 Текст: не задан")
+    parts.append("🖼 Фото: есть" if draft.get("photo_file_id") else "🖼 Фото: нет")
+    btn_count = len(draft.get("buttons", []))
+    parts.append(f"🔗 Кнопок: {btn_count}" if btn_count else "🔗 Кнопок: нет")
+    return "\n".join(parts)
+
+
+def _draft_keyboard(has_buttons: bool = False) -> InlineKeyboardMarkup:
+    """Клавиатура для работы с черновиком.
+
+    Args:
+        has_buttons: если True — показывает дополнительную кнопку управления кнопками.
+    """
+    rows = [
         [
             InlineKeyboardButton("👁️ Предпросмотр", callback_data="draft_preview"),
             InlineKeyboardButton("💾 Сохранить", callback_data="draft_save"),
@@ -315,7 +373,8 @@ def _draft_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📤 Отправить", callback_data="draft_send"),
             InlineKeyboardButton("🔙 Главное меню", callback_data="draft_back_to_menu"),
         ],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 async def _send_draft_preview(target, context: ContextTypes.DEFAULT_TYPE, draft: dict):
@@ -537,15 +596,36 @@ def _get_subscribers_stats() -> dict:
                     """
                 )
                 month_count = cur.fetchone()["cnt"]
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM subscribers
+                    WHERE joined_at >= CURRENT_DATE
+                    """
+                )
+                today_count = cur.fetchone()["cnt"]
+                cur.execute(
+                    """
+                    SELECT EXTRACT(HOUR FROM joined_at)::int AS hour,
+                           COUNT(*) AS cnt
+                    FROM subscribers
+                    GROUP BY hour
+                    ORDER BY cnt DESC
+                    LIMIT 3
+                    """
+                )
+                top_hours = cur.fetchall()
         return {
             "total": total,
             "recent": recent,
             "week": week_count,
             "month": month_count,
+            "today": today_count,
+            "top_hours": top_hours,
         }
     except Exception as e:
         logger.error(f"❌ Ошибка получения статистики: {e}")
-        return {"total": 0, "recent": [], "week": 0, "month": 0}
+        return {"total": 0, "recent": [], "week": 0, "month": 0, "today": 0, "top_hours": []}
 
 
 def _history_keyboard(rows: list, page: int, total: int, per_page: int = 5) -> InlineKeyboardMarkup:
@@ -964,26 +1044,30 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if "current_draft" not in context.user_data:
         return
+
     new_text = update.message.text or ""
-draft = _get_draft(context)
+    draft = _get_draft(context)
 
-clean_text, new_buttons = _parse_buttons_from_text(new_text)
+    clean_text, new_buttons = _parse_buttons_from_text(new_text)
 
-# добавляем текст
-if clean_text:
-    if draft["text"]:
-        draft["text"] += "\n" + clean_text
-    else:
-        draft["text"] = clean_text
+    # добавляем текст
+    if clean_text:
+        if draft["text"]:
+            draft["text"] += "\n" + clean_text
+        else:
+            draft["text"] = clean_text
 
-# добавляем кнопки
-if new_buttons:
-    draft["buttons"].extend(new_buttons)
+    # добавляем кнопки
+    if new_buttons:
+        draft["buttons"].extend(new_buttons)
+
     context.user_data["draft_unsaved_changes"] = True
     char_count = len(draft["text"])
+    btn_count = len(draft["buttons"])
+    status = _draft_status_text(draft)
     await update.message.reply_text(
-        f"✅ Текст добавлен ({char_count} символов)",
-        reply_markup=_draft_keyboard(),
+        f"✅ Текст добавлен ({char_count} симв.)" + (f", кнопок: {btn_count}" if btn_count else "") + f"\n\n{status}",
+        reply_markup=_draft_keyboard(has_buttons=bool(draft["buttons"])),
     )
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1253,47 @@ async def drafts_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+# ---------------------------------------------------------------------------
+# /stats — статистика подписчиков (только для администраторов)
+# ---------------------------------------------------------------------------
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статистику подписчиков."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ У тебя нет прав для просмотра статистики.")
+        return
+
+    stats = _get_subscribers_stats()
+    text = (
+        "📊 <b>Статистика подписчиков</b>\n\n"
+        f"👥 Всего: <b>{stats['total']}</b>\n"
+        f"📅 Сегодня: <b>{stats['today']}</b>\n"
+        f"📈 За 7 дней: <b>{stats['week']}</b>\n"
+        f"📆 За 30 дней: <b>{stats['month']}</b>\n"
+    )
+    if stats.get("top_hours"):
+        text += "\n⏰ <b>Пиковые часы подписок:</b>\n"
+        for row in stats["top_hours"]:
+            text += f"  {row['hour']:02d}:00 — {row['cnt']} чел.\n"
+    if stats["recent"]:
+        text += "\n🕐 <b>Последние 10 подписчиков:</b>\n"
+        for i, sub in enumerate(stats["recent"], 1):
+            username = f"@{sub['username']}" if sub["username"] else "—"
+            name = sub["first_name"] or "—"
+            joined = sub["joined_at"].strftime("%d.%m.%Y %H:%M") if sub["joined_at"] else "—"
+            text += f"{i}. {name} ({username}) — {joined}\n"
+    else:
+        text += "\nПодписчиков пока нет."
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Главное меню", callback_data="menu_main")],
+        ]),
+    )
+
+
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1178,6 +1303,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("users", users))
+    app.add_handler(CommandHandler("stats", stats_command))
 
     # Панель управления рассылками
     app.add_handler(CommandHandler("menu", menu_command))
