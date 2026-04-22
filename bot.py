@@ -965,24 +965,26 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if "current_draft" not in context.user_data:
         return
     new_text = update.message.text or ""
-draft = _get_draft(context)
+    draft = _get_draft(context)
 
-clean_text, new_buttons = _parse_buttons_from_text(new_text)
+    clean_text, new_buttons = _parse_buttons_from_text(new_text)
 
-# добавляем текст
-if clean_text:
-    if draft["text"]:
-        draft["text"] += "\n" + clean_text
-    else:
-        draft["text"] = clean_text
+    # добавляем текст
+    if clean_text:
+        if draft["text"]:
+            draft["text"] += "\n" + clean_text
+        else:
+            draft["text"] = clean_text
 
-# добавляем кнопки
-if new_buttons:
-    draft["buttons"].extend(new_buttons)
+    if new_buttons:
+        draft["buttons"].extend(new_buttons)
+
     context.user_data["draft_unsaved_changes"] = True
     char_count = len(draft["text"])
+
+    btn_note = f" (+{len(new_buttons)} кнопок)" if new_buttons else ""
     await update.message.reply_text(
-        f"✅ Текст добавлен ({char_count} символов)",
+        f"✅ Текст добавлен ({char_count} символов){btn_note}",
         reply_markup=_draft_keyboard(),
     )
 
